@@ -864,12 +864,6 @@ static int xpad_init_output(struct usb_interface *intf, struct usb_xpad *xpad)
  fail1:	return error;
 }
 
-static void xpad_stop_output(struct usb_xpad *xpad)
-{
-	if (xpad->xtype != XTYPE_UNKNOWN)
-		usb_kill_urb(xpad->irq_out);
-}
-
 static void xpad_deinit_output(struct usb_xpad *xpad)
 {
 	if (xpad->xtype != XTYPE_UNKNOWN) {
@@ -930,7 +924,7 @@ static int xpad_start_xbox_one(struct usb_xpad *xpad)
 	packet->len = 5;
 	packet->pending = true;
 
-	retval = usb_submit_urb(xpad->irq_out, GFP_KERNEL);
+	retval = usb_submit_urb(xpad->irq_out, GFP_KERNEL) ? -EIO : 0;
 
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 
@@ -1194,32 +1188,73 @@ static void xpad_led_disconnect(struct usb_xpad *xpad) { }
 static void xpad_identify_controller(struct usb_xpad *xpad) { }
 #endif
 
+static int xpad_start_input(struct usb_xpad *xpad)
+{
+	int error;
+
+	if (usb_submit_urb(xpad->irq_in, GFP_KERNEL))
+		return -EIO;
+
+	if (xpad->xtype == XTYPE_XBOXONE) {
+		error = xpad_start_xbox_one(xpad);
+		if (error) {
+			usb_kill_urb(xpad->irq_in);
+			return error;
+		}
+	}
+
+	return 0;
+}
+
+static void xpad_stop_input(struct usb_xpad *xpad)
+{
+	usb_kill_urb(xpad->irq_in);
+}
+
+static int xpad360w_start_input(struct usb_xpad *xpad)
+{
+	int error;
+
+	error = usb_submit_urb(xpad->irq_in, GFP_KERNEL);
+	if (error)
+		return -EIO;
+
+	/*
+	 * Send presence packet.
+	 * This will force the controller to resend connection packets.
+	 * This is useful in the case we activate the module after the
+	 * adapter has been plugged in, as it won't automatically
+	 * send us info about the controllers.
+	 */
+	error = xpad_inquiry_pad_presence(xpad);
+	if (error) {
+		usb_kill_urb(xpad->irq_in);
+		return error;
+	}
+
+	return 0;
+}
+
+static void xpad360w_stop_input(struct usb_xpad *xpad)
+{
+	usb_kill_urb(xpad->irq_in);
+
+	/* Make sure we are done with presence work if it was scheduled */
+	flush_work(&xpad->work);
+}
+
 static int xpad_open(struct input_dev *dev)
 {
 	struct usb_xpad *xpad = input_get_drvdata(dev);
 
-	/* URB was submitted in probe */
-	if (xpad->xtype == XTYPE_XBOX360W)
-		return 0;
-
-	xpad->irq_in->dev = xpad->udev;
-	if (usb_submit_urb(xpad->irq_in, GFP_KERNEL))
-		return -EIO;
-
-	if (xpad->xtype == XTYPE_XBOXONE)
-		return xpad_start_xbox_one(xpad);
-
-	return 0;
+	return xpad_start_input(xpad);
 }
 
 static void xpad_close(struct input_dev *dev)
 {
 	struct usb_xpad *xpad = input_get_drvdata(dev);
 
-	if (xpad->xtype != XTYPE_XBOX360W)
-		usb_kill_urb(xpad->irq_in);
-
-	xpad_stop_output(xpad);
+	xpad_stop_input(xpad);
 }
 
 static void xpad_set_up_abs(struct input_dev *input_dev, signed short abs)
@@ -1274,8 +1309,10 @@ static int xpad_init_input(struct usb_xpad *xpad)
 
 	input_set_drvdata(input_dev, xpad);
 
-	input_dev->open = xpad_open;
-	input_dev->close = xpad_close;
+	if (xpad->xtype != XTYPE_XBOX360W) {
+		input_dev->open = xpad_open;
+		input_dev->close = xpad_close;
+	}
 
 	__set_bit(EV_KEY, input_dev->evbit);
 
@@ -1443,21 +1480,9 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 		 * exactly the message that a controller has arrived that
 		 * we're waiting for.
 		 */
-		xpad->irq_in->dev = xpad->udev;
-		error = usb_submit_urb(xpad->irq_in, GFP_KERNEL);
+		error = xpad360w_start_input(xpad);
 		if (error)
 			goto err_deinit_output;
-
-		/*
-		 * Send presence packet.
-		 * This will force the controller to resend connection packets.
-		 * This is useful in the case we activate the module after the
-		 * adapter has been plugged in, as it won't automatically
-		 * send us info about the controllers.
-		 */
-		error = xpad_inquiry_pad_presence(xpad);
-		if (error)
-			goto err_kill_in_urb;
 	} else {
 		error = xpad_init_input(xpad);
 		if (error)
@@ -1465,8 +1490,6 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	}
 	return 0;
 
-err_kill_in_urb:
-	usb_kill_urb(xpad->irq_in);
 err_deinit_output:
 	xpad_deinit_output(xpad);
 err_free_in_urb:
@@ -1476,19 +1499,23 @@ err_free_idata:
 err_free_mem:
 	kfree(xpad);
 	return error;
-
 }
 
 static void xpad_disconnect(struct usb_interface *intf)
 {
-	struct usb_xpad *xpad = usb_get_intfdata (intf);
+	struct usb_xpad *xpad = usb_get_intfdata(intf);
 
 	if (xpad->xtype == XTYPE_XBOX360W)
-		usb_kill_urb(xpad->irq_in);
-
-	cancel_work_sync(&xpad->work);
+		xpad360w_stop_input(xpad);
 
 	xpad_deinit_input(xpad);
+
+	/*
+	 * Now that both input device and LED device are gone we can
+	 * stop output URB.
+	 */
+	if (xpad->xtype == XTYPE_XBOX360W)
+		usb_kill_urb(xpad->irq_out);
 
 	usb_free_urb(xpad->irq_in);
 	usb_free_coherent(xpad->udev, XPAD_PKT_LEN,
@@ -1501,10 +1528,55 @@ static void xpad_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 }
 
+static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct usb_xpad *xpad = usb_get_intfdata(intf);
+	struct input_dev *input = xpad->dev;
+
+	if (xpad->xtype == XTYPE_XBOX360W) {
+		/*
+		 * Wireless controllers always listen to input so
+		 * they are notified when controller shows up
+		 * or goes away.
+		 */
+		xpad360w_stop_input(xpad);
+	} else {
+		mutex_lock(&input->mutex);
+		if (input->users)
+			xpad_stop_input(xpad);
+		mutex_unlock(&input->mutex);
+	}
+
+	if (xpad->xtype != XTYPE_UNKNOWN)
+		usb_kill_urb(xpad->irq_out);
+
+	return 0;
+}
+
+static int xpad_resume(struct usb_interface *intf)
+{
+	struct usb_xpad *xpad = usb_get_intfdata(intf);
+	struct input_dev *input = xpad->dev;
+	int retval = 0;
+
+	if (xpad->xtype == XTYPE_XBOX360W) {
+		retval = xpad360w_start_input(xpad);
+	} else {
+		mutex_lock(&input->mutex);
+		if (input->users)
+			retval = xpad_start_input(xpad);
+		mutex_unlock(&input->mutex);
+	}
+
+	return retval;
+}
+
 static struct usb_driver xpad_driver = {
 	.name		= "xpad",
 	.probe		= xpad_probe,
 	.disconnect	= xpad_disconnect,
+	.suspend	= xpad_suspend,
+	.resume		= xpad_resume,
 	.id_table	= xpad_table,
 };
 
