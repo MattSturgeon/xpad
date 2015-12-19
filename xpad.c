@@ -1540,6 +1540,7 @@ static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 		 * or goes away.
 		 */
 		xpad360w_stop_input(xpad);
+		xpad->udev->reset_resume = 1;
 	} else {
 		mutex_lock(&input->mutex);
 		if (input->users)
@@ -1577,6 +1578,7 @@ static struct usb_driver xpad_driver = {
 	.disconnect	= xpad_disconnect,
 	.suspend	= xpad_suspend,
 	.resume		= xpad_resume,
+	.reset_resume	= xpad_resume,
 	.id_table	= xpad_table,
 };
 
