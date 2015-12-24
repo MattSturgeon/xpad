@@ -346,9 +346,10 @@ struct usb_xpad {
 	dma_addr_t idata_dma;
 
 	struct urb *irq_out;		/* urb for interrupt out report */
+	struct usb_anchor irq_out_anchor;
 	bool irq_out_active;		/* we must not use an active URB */
-	unsigned char *odata;		/* output data */
 	u8 odata_serial;		/* serial number for xbox one protocol */
+	unsigned char *odata;		/* output data */
 	dma_addr_t odata_dma;
 	spinlock_t odata_lock;
 
@@ -764,11 +765,13 @@ static int xpad_try_sending_next_out_packet(struct usb_xpad *xpad)
 	int error;
 
 	if (!xpad->irq_out_active && xpad_prepare_next_out_packet(xpad)) {
+		usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
 		error = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
 		if (error) {
 			dev_err(&xpad->intf->dev,
 				"%s - usb_submit_urb failed with result %d\n",
 				__func__, error);
+			usb_unanchor_urb(xpad->irq_out);
 			return -EIO;
 		}
 
@@ -811,11 +814,13 @@ static void xpad_irq_out(struct urb *urb)
 	}
 
 	if (xpad->irq_out_active) {
+		usb_anchor_urb(urb, &xpad->irq_out_anchor);
 		error = usb_submit_urb(urb, GFP_ATOMIC);
 		if (error) {
 			dev_err(dev,
 				"%s - usb_submit_urb failed with result %d\n",
 				__func__, error);
+			usb_unanchor_urb(urb);
 			xpad->irq_out_active = false;
 		}
 	}
@@ -831,6 +836,8 @@ static int xpad_init_output(struct usb_interface *intf, struct usb_xpad *xpad)
 
 	if (xpad->xtype == XTYPE_UNKNOWN)
 		return 0;
+
+	init_usb_anchor(&xpad->irq_out_anchor);
 
 	xpad->odata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN,
 					 GFP_KERNEL, &xpad->odata_dma);
@@ -862,6 +869,18 @@ static int xpad_init_output(struct usb_interface *intf, struct usb_xpad *xpad)
 
  fail2:	usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->odata, xpad->odata_dma);
  fail1:	return error;
+}
+
+static void xpad_stop_output(struct usb_xpad *xpad)
+{
+	if (xpad->xtype != XTYPE_UNKNOWN) {
+		if (!usb_wait_anchor_empty_timeout(&xpad->irq_out_anchor,
+						   5000)) {
+			dev_warn(&xpad->intf->dev,
+				 "timed out waiting for output URB to complete, killing\n");
+			usb_kill_anchored_urbs(&xpad->irq_out_anchor);
+		}
+	}
 }
 
 static void xpad_deinit_output(struct usb_xpad *xpad)
@@ -924,7 +943,15 @@ static int xpad_start_xbox_one(struct usb_xpad *xpad)
 	packet->len = 5;
 	packet->pending = true;
 
-	retval = usb_submit_urb(xpad->irq_out, GFP_KERNEL) ? -EIO : 0;
+	usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
+	retval = usb_submit_urb(xpad->irq_out, GFP_KERNEL);
+	if (retval) {
+		dev_err(&xpad->intf->dev,
+			"%s - usb_submit_urb failed with result %d\n",
+			__func__, retval);
+		usb_unanchor_urb(xpad->irq_out);
+		retval = -EIO;
+	}
 
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 
@@ -1514,14 +1541,13 @@ static void xpad_disconnect(struct usb_interface *intf)
 	 * Now that both input device and LED device are gone we can
 	 * stop output URB.
 	 */
-	if (xpad->xtype == XTYPE_XBOX360W)
-		usb_kill_urb(xpad->irq_out);
+	xpad_stop_output(xpad);
+
+	xpad_deinit_output(xpad);
 
 	usb_free_urb(xpad->irq_in);
 	usb_free_coherent(xpad->udev, XPAD_PKT_LEN,
 			xpad->idata, xpad->idata_dma);
-
-	xpad_deinit_output(xpad);
 
 	kfree(xpad);
 
@@ -1548,8 +1574,7 @@ static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 		mutex_unlock(&input->mutex);
 	}
 
-	if (xpad->xtype != XTYPE_UNKNOWN)
-		usb_kill_urb(xpad->irq_out);
+	xpad_stop_output(xpad);
 
 	return 0;
 }
