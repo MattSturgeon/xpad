@@ -798,7 +798,7 @@ static void xpad_irq_out(struct urb *urb)
 	case 0:
 		/* success */
 		xpad->out_packets[xpad->last_out_packet].pending = false;
-		xpad->irq_out_active = xpad_prepare_next_out_packet(xpad);
+		xpad->irq_out_active = xpad_prepare_next_out_packet(xpad);//Wait, what?
 		break;
 
 	case -ECONNRESET:
@@ -1036,8 +1036,10 @@ static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect 
 		goto out;
 	}
 
+  printk("%s: about to run xpad_try_sending_next_out_packet()...\n",__func__);//DEBUGGING
 	retval = xpad_try_sending_next_out_packet(xpad);
 
+	  printk("%s: xpad_try_sending_next_out_packet() returned %d\n",__func__, retval);//DEBUGGING
 out:
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 	return retval;
